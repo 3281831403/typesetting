@@ -423,3 +423,43 @@ func TestIteratorsReuse(t *testing.T) {
 	}
 	tu.Assert(t, seg.Len() == len(text))
 }
+
+func TestIsGraphemeBoundary(t *testing.T) {
+	// "a" + combining circumflex + combining tilde, then "b":
+	// the three first runes form a single grapheme cluster.
+	text := []rune{'a', '̂', '̃', 'b'}
+	var seg Segmenter
+	seg.Init(text)
+
+	got := make([]bool, len(text)+1)
+	for i := range got {
+		got[i] = seg.IsGraphemeBoundary(i)
+	}
+	want := []bool{true, false, false, true, true} // GB1, ×, ×, ÷, GB2
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("IsGraphemeBoundary = %v, want %v", got, want)
+	}
+
+	// out of range positions are not boundaries
+	tu.Assert(t, !seg.IsGraphemeBoundary(-1))
+	tu.Assert(t, !seg.IsGraphemeBoundary(len(text)+1))
+
+	// the boundaries reported by the predicate match the iterator segments
+	var iterBoundaries []int
+	iter := seg.GraphemeIterator()
+	for iter.Next() {
+		g := iter.Grapheme()
+		iterBoundaries = append(iterBoundaries, g.Offset)
+	}
+	// the iterator's last segment ends at the end of the paragraph
+	iterBoundaries = append(iterBoundaries, len(text))
+	var predicateBoundaries []int
+	for i := 0; i <= len(text); i++ {
+		if seg.IsGraphemeBoundary(i) {
+			predicateBoundaries = append(predicateBoundaries, i)
+		}
+	}
+	if !reflect.DeepEqual(iterBoundaries, predicateBoundaries) {
+		t.Fatalf("iterator boundaries %v differ from predicate boundaries %v", iterBoundaries, predicateBoundaries)
+	}
+}

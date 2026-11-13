@@ -436,6 +436,23 @@ func (sg *Segmenter) GraphemeIterator() *GraphemeIterator {
 	return &GraphemeIterator{attributeIterator: attributeIterator{src: sg, flag: graphemeBoundary}}
 }
 
+// IsGraphemeBoundary reports whether the position before the rune at
+// index (in runes) is a grapheme cluster boundary, according to the
+// rules of UAX#29.
+//
+// As required by the segmentation rules, position 0 and position
+// [Segmenter.Len] (just past the last rune) are always boundaries.
+// Positions outside the range [0, Len] are not boundaries.
+//
+// The Segmenter must have been initialized with the paragraph
+// containing the rune at index.
+func (sg *Segmenter) IsGraphemeBoundary(index int) bool {
+	if index < 0 || index >= len(sg.attributes) {
+		return false
+	}
+	return sg.attributes[index]&graphemeBoundary != 0
+}
+
 // Word is the content of a word delimited by the segmenter.
 //
 // More precisely, a word is formed by runes

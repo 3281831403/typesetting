@@ -10,6 +10,7 @@ import (
 	"github.com/go-text/typesetting/harfbuzz"
 	ucd "github.com/go-text/typesetting/internal/unicodedata"
 	"github.com/go-text/typesetting/language"
+	"github.com/go-text/typesetting/segmenter"
 	"golang.org/x/image/math/fixed"
 )
 
@@ -88,7 +89,28 @@ type FontmapScript interface {
 	SetScript(language.Script)
 }
 
-var _ Fontmap = fixedFontmap(nil)
+// FontmapGraphemeCluster is an optional [Fontmap] extension selecting the face
+// for a whole grapheme cluster at once.
+//
+// It is used by [SplitByFace] and [Segmenter.Split] so that a base character
+// and its combining marks are always assigned to the same face: the returned
+// face should support every rune of the cluster, falling back to another face
+// when the preferred one is missing one of the marks.
+//
+// The runes are a subslice of the input paragraph covering one grapheme
+// cluster. As with [Fontmap.ResolveFace], the returned face must never be nil.
+type FontmapGraphemeCluster interface {
+	Fontmap
+
+	// ResolveFaceForGraphemeCluster resolves the face to use for the given
+	// grapheme cluster.
+	ResolveFaceForGraphemeCluster(cluster []rune) *font.Face
+}
+
+var (
+	_ Fontmap                = fixedFontmap(nil)
+	_ FontmapGraphemeCluster = fixedFontmap(nil)
+)
 
 type fixedFontmap []*font.Face
 
@@ -100,6 +122,26 @@ func (ff fixedFontmap) ResolveFace(r rune) *font.Face {
 		}
 	}
 	return ff[0]
+}
+
+// ResolveFaceForGraphemeCluster returns the first font providing a nominal
+// glyph for every rune of the cluster. If no font covers the whole cluster,
+// the first font covering its first rune is used, or simply the first font,
+// matching [ResolveFace] for the cluster's base rune.
+func (ff fixedFontmap) ResolveFaceForGraphemeCluster(cluster []rune) *font.Face {
+	for _, f := range ff {
+		supportsAll := true
+		for _, r := range cluster {
+			if _, has := f.NominalGlyph(r); !has {
+				supportsAll = false
+				break
+			}
+		}
+		if supportsAll {
+			return f
+		}
+	}
+	return ff.ResolveFace(cluster[0])
 }
 
 // SplitByFontGlyphs split the runes from 'input' to several items, sharing the same
@@ -119,8 +161,14 @@ func SplitByFontGlyphs(input Input, availableFaces []*font.Face) []Input {
 // characteristics as 'input', expected for the `Face` which is set to
 // the return value of the [Fontmap.ResolveFace] call.
 // The 'Face' field of 'input' is ignored: only 'availableFaces' is used to select the face.
+//
+// Face changes only happen on grapheme cluster boundaries, so combining marks
+// are always kept in the same run, and shaped by the same font, as their base
+// character.
 func SplitByFace(input Input, availableFaces Fontmap) []Input {
-	return splitByFace(input, availableFaces, nil, true)
+	var graphemes segmenter.Segmenter
+	graphemes.Init(input.Text)
+	return splitByFace(input, availableFaces, nil, true, &graphemes)
 }
 
 // Segmenter holds a state used to split input
@@ -136,6 +184,10 @@ type Segmenter struct {
 
 	// buffer used for bidi segmentation
 	bidiParagraph bidi.Paragraph
+
+	// graphemes computes the grapheme cluster boundaries used to make sure
+	// face changes never split a grapheme cluster.
+	graphemes segmenter.Segmenter
 }
 
 type delimEntry struct {
@@ -190,6 +242,9 @@ func (seg *Segmenter) Split(text Input, faces Fontmap) []Input {
 
 	seg.input, seg.output = seg.output, seg.input
 	seg.output = seg.output[:0]
+	// compute the grapheme cluster boundaries of the whole paragraph once,
+	// so that [splitByFace] can keep each cluster in a single face
+	seg.graphemes.Init(text.Text)
 	seg.splitByFace(faces)
 
 	return seg.output
@@ -418,49 +473,194 @@ func (seg *Segmenter) splitByVertOrientation() {
 	}
 }
 
-// assume [splitByScript] has been called
+// assume [splitByScript] has been called and [graphemes] has been
+// initialized with the whole paragraph
 func (seg *Segmenter) splitByFace(faces Fontmap) {
 	withScript, hasScriptSupport := faces.(FontmapScript)
-	lastRunWithoutFace := -1
-	for i, input := range seg.input {
-		if hasScriptSupport {
-			withScript.SetScript(input.Script)
+	clusterFontmap, hasClusterSupport := faces.(FontmapGraphemeCluster)
+
+	if len(seg.input) == 0 {
+		return
+	}
+	text := seg.input[0].Text
+	paragraphStart := seg.input[0].RunStart
+	paragraphEnd := seg.input[len(seg.input)-1].RunEnd
+	seg.output = seg.output[:0]
+
+	// runCursor indexes the upstream run (from bidi/script/orientation
+	// splitting) containing the current grapheme cluster; scriptCursor is the
+	// last upstream run whose script hint has been pushed to the font map
+	runCursor, scriptCursor := 0, -1
+	// current is the output run being built, or nil before the first cluster
+	var current *Input
+
+	clusterStart := paragraphStart
+	for clusterStart < paragraphEnd {
+		// end of the grapheme cluster starting at clusterStart
+		clusterEnd := clusterStart + 1
+		for clusterEnd < paragraphEnd && !seg.graphemes.IsGraphemeBoundary(clusterEnd) {
+			clusterEnd++
 		}
-		isLast := i == len(seg.input)-1
-		L := len(seg.output)
-		seg.output = splitByFace(input, faces, seg.output, isLast)
-		if face := seg.output[L].Face; face != nil {
-			if lastRunWithoutFace != -1 {
-				// apply it back
-				for k := lastRunWithoutFace; k < L; k++ {
-					seg.output[k].Face = face
-				}
-				// reset the marker
-				lastRunWithoutFace = -1
+
+		// move to the upstream run containing the first rune of the cluster,
+		// tracking whether an upstream boundary was crossed
+		upstreamChanged := false
+		for runCursor < len(seg.input) && seg.input[runCursor].RunEnd <= clusterStart {
+			runCursor++
+			upstreamChanged = true
+		}
+		upstream := seg.input[runCursor]
+		// the font map may use the script hint to resolve a face, so push it
+		// before the first resolution of each upstream run, including the first
+		if hasScriptSupport && runCursor != scriptCursor {
+			withScript.SetScript(upstream.Script)
+			scriptCursor = runCursor
+		}
+		// a cluster spills when an earlier stage split it from one of its marks,
+		// so that it spans more than one upstream run; such a boundary must be
+		// absorbed rather than split the cluster
+		spills := clusterEnd > upstream.RunEnd
+
+		firstRune := text[clusterStart]
+		if ignoreFaceChange(firstRune) {
+			// ignorable runes (spaces, controls, format characters such as ZWJ)
+			// do not select a face; they extend the current run, opening a face
+			// less one only when they start a new upstream run. Their face is
+			// resolved later, by back filling from the following face run, or by
+			// resolving the last rune for an all ignorable paragraph.
+			if current == nil {
+				in := upstream
+				in.RunStart, in.RunEnd = clusterStart, clusterEnd
+				seg.output = append(seg.output, in)
+				current = &seg.output[len(seg.output)-1]
+			} else if upstreamChanged && !spills {
+				in := upstream
+				in.RunStart, in.RunEnd = clusterStart, clusterEnd
+				seg.output = append(seg.output, in)
+				current = &seg.output[len(seg.output)-1]
+			} else {
+				current.RunEnd = clusterEnd
 			}
+			clusterStart = clusterEnd
+			continue
+		}
+
+		// resolve the face for the whole grapheme cluster at once
+		var selectedFace *font.Face
+		if hasClusterSupport {
+			selectedFace = clusterFontmap.ResolveFaceForGraphemeCluster(text[clusterStart:clusterEnd])
 		} else {
-			// in this case, only one run has been added by splitByFace
-			if lastRunWithoutFace == -1 {
-				lastRunWithoutFace = L
+			selectedFace = faces.ResolveFace(firstRune)
+		}
+
+		switch {
+		case current == nil:
+			// first face of the paragraph
+			in := upstream
+			in.RunStart, in.RunEnd = clusterStart, clusterEnd
+			in.Face = selectedFace
+			seg.output = append(seg.output, in)
+			current = &seg.output[len(seg.output)-1]
+		case spills:
+			// the cluster spans an upstream boundary: keep it whole in the run
+			// it starts in and give that run the resolved face if needed
+			current.RunEnd = clusterEnd
+			if current.Face == nil {
+				current.Face = selectedFace
 			}
+		case upstreamChanged:
+			// a real upstream boundary on a grapheme cluster boundary: new run
+			in := upstream
+			in.RunStart, in.RunEnd = clusterStart, clusterEnd
+			in.Face = selectedFace
+			seg.output = append(seg.output, in)
+			current = &seg.output[len(seg.output)-1]
+		case current.Face == nil:
+			// first face after leading face less runes in the same upstream run:
+			// extend it and assign the face
+			current.RunEnd = clusterEnd
+			current.Face = selectedFace
+		case current.Face != selectedFace:
+			// an actual face change: new run carrying the current properties
+			in := *current
+			in.RunStart, in.RunEnd = clusterStart, clusterEnd
+			in.Face = selectedFace
+			seg.output = append(seg.output, in)
+			current = &seg.output[len(seg.output)-1]
+		default:
+			// same face and same upstream run: keep accumulating clusters
+			current.RunEnd = clusterEnd
+		}
+
+		clusterStart = clusterEnd
+	}
+
+	switch {
+	case current == nil:
+		// empty paragraph: emit a single face less run
+		in := seg.input[0]
+		in.RunStart, in.RunEnd = paragraphStart, paragraphEnd
+		seg.output = append(seg.output, in)
+	case current.Face == nil:
+		// the paragraph only contains ignorable runes: resolve a face on its
+		// last rune, like [splitByFace] does for its final run
+		current.Face = faces.ResolveFace(text[paragraphEnd-1])
+	}
+
+	// back fill the face less runs (spaces, controls, ZWJ...) with the face of
+	// the run immediately following them
+	for i := len(seg.output) - 2; i >= 0; i-- {
+		if seg.output[i].Face == nil {
+			seg.output[i].Face = seg.output[i+1].Face
 		}
 	}
 }
 
-func splitByFace(input Input, availableFaces Fontmap, buffer []Input, isLast bool) []Input {
+// splitByFace split the runes from 'input' to several items, sharing the same
+// characteristics as 'input', except for the `Face` which is set to
+// the return value of the [Fontmap.ResolveFace] call.
+//
+// Face selection is performed per grapheme cluster, never per rune: a cluster
+// is always assigned entirely to one face, so that combining marks stay with
+// their base character and are shaped by the same font. Grapheme cluster
+// boundaries are read from 'graphemes', which must have been initialized with
+// the whole paragraph containing [input.Text].
+func splitByFace(input Input, availableFaces Fontmap, buffer []Input, isLast bool, graphemes *segmenter.Segmenter) []Input {
+	// an empty run is returned unchanged and keeps its nil face
+	if input.RunStart >= input.RunEnd {
+		return append(buffer, input)
+	}
+
+	clusterFontmap, hasClusterSupport := availableFaces.(FontmapGraphemeCluster)
 	currentInput := input
-	for i := input.RunStart; i < input.RunEnd; i++ {
-		r := input.Text[i]
+	clusterStart := input.RunStart
+	for clusterStart < input.RunEnd {
+		// find the end of the grapheme cluster starting at clusterStart
+		clusterEnd := clusterStart + 1
+		for clusterEnd < input.RunEnd && !graphemes.IsGraphemeBoundary(clusterEnd) {
+			clusterEnd++
+		}
+
+		firstRune := input.Text[clusterStart]
 		// We can safely ignore characters if we have a face or if there is more text,
 		// but we must force the choice of a face if we still don't have one and we reach
 		// the final rune. Otherwise strings like all-whitespace are never assigned a face.
-		if ignoreFaceChange(r) && (currentInput.Face != nil || !isLast || i < input.RunEnd-1) {
-			// add the rune to the current input
+		if ignoreFaceChange(firstRune) && (currentInput.Face != nil || !isLast || clusterEnd < input.RunEnd) {
+			// add the cluster to the current input
+			clusterStart = clusterEnd
 			continue
 		}
 
-		// select the first font supporting r
-		selectedFace := availableFaces.ResolveFace(r)
+		// select the face for the whole grapheme cluster at once, so that a base
+		// character and its combining marks are never split between two faces;
+		// font maps without cluster support resolve the face through the first
+		// rune of the cluster, which is itself always a cluster boundary
+		var selectedFace *font.Face
+		if hasClusterSupport {
+			selectedFace = clusterFontmap.ResolveFaceForGraphemeCluster(input.Text[clusterStart:clusterEnd])
+		} else {
+			selectedFace = availableFaces.ResolveFace(firstRune)
+		}
 
 		// now that we have a font, apply it back,
 		// but do NOT create a new run
@@ -469,23 +669,26 @@ func splitByFace(input Input, availableFaces Fontmap, buffer []Input, isLast boo
 		}
 
 		if currentInput.Face == selectedFace {
-			// add the rune to the current input
+			// add the cluster to the current input
+			clusterStart = clusterEnd
 			continue
 		}
 
 		// new face needed
 
-		if i != input.RunStart {
+		if clusterStart != input.RunStart {
 			// close the current input ...
-			currentInput.RunEnd = i
+			currentInput.RunEnd = clusterStart
 			// ... add it to the output ...
 			buffer = append(buffer, currentInput)
 		}
 
 		// ... and create a new one
 		currentInput = input
-		currentInput.RunStart = i
+		currentInput.RunStart = clusterStart
 		currentInput.Face = selectedFace
+
+		clusterStart = clusterEnd
 	}
 
 	// close and add the last input
