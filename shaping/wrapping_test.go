@@ -3841,6 +3841,128 @@ func TestWrapParagraphSegmentedInit(t *testing.T) {
 	}
 }
 
+// TestWrapSameDirectionParagraphDirection checks that a paragraph made of a
+// single run of same-direction text wraps to the same lines whether the
+// paragraph direction matches the text direction or not: the whitespace
+// ending a line is never sandwiched between other text of the line, so it
+// must not count toward the line width in either case. It also checks that
+// no line exceeds the given width, and that [LineWrapper.Prepare] and
+// [LineWrapper.PrepareSegmented] (and thus [LineWrapper.WrapParagraph])
+// agree, with and without truncation.
+func TestWrapSameDirectionParagraphDirection(t *testing.T) {
+	texts := []struct {
+		name   string
+		text   []rune
+		dir    di.Direction
+		face   *font.Face
+		script language.Script
+		lang   string
+	}{
+		{"arabic", []rune("الحب سماء تمط غير الأحلام الحب سماء تمط غير الأحلام الحب سماء"), di.DirectionRTL, benchArFace, language.Arabic, "AR"},
+		{"latin", []rune("the quick brown fox jumps over the lazy dog the quick brown fox"), di.DirectionLTR, benchEnFace, language.Latin, "EN"},
+	}
+	var shaper HarfbuzzShaper
+	// wrap collects, for each line, the end of the line (as a rune index),
+	// the advance of the line and the trimmed trailing whitespace, using
+	// [LineWrapper.Prepare].
+	wrap := func(config WrapConfig, width int, text []rune, out Output) (ends []int, advances, trimmed []fixed.Int26_6, truncated int) {
+		var l LineWrapper
+		l.Prepare(config, text, NewSliceIterator([]Output{out.copy()}))
+		for {
+			line, done := l.WrapNextLine(width)
+			if line.Line == nil {
+				break
+			}
+			var advance fixed.Int26_6
+			end := 0
+			for _, run := range line.Line {
+				advance += run.Advance
+				end = run.Runes.Offset + run.Runes.Count
+			}
+			ends = append(ends, end)
+			advances = append(advances, advance)
+			trimmed = append(trimmed, line.TrimmedTrailingWhitespace)
+			truncated = line.Truncated
+			if done {
+				break
+			}
+		}
+		return ends, advances, trimmed, truncated
+	}
+	for _, tc := range texts {
+		t.Run(tc.name, func(t *testing.T) {
+			out := shaper.Shape(Input{
+				Text: tc.text, RunEnd: len(tc.text), Direction: tc.dir,
+				Face: tc.face, Size: fixed.I(16), Script: tc.script, Language: language.NewLanguage(tc.lang),
+			})
+			// The segmenter is initialized once and reused for every
+			// wrapping, exercising the PrepareSegmented entry point.
+			var seg segmenter.Segmenter
+			seg.Init(tc.text)
+			for _, truncateAfterLines := range []int{0, 2} {
+				for width := 40; width <= 80; width++ {
+					type result struct {
+						ends      []int
+						advances  []fixed.Int26_6
+						trimmed   []fixed.Int26_6
+						truncated int
+					}
+					results := make([]result, 2)
+					for i, paraDir := range []di.Direction{di.DirectionLTR, di.DirectionRTL} {
+						config := WrapConfig{Direction: paraDir, TruncateAfterLines: truncateAfterLines}
+						ends, advances, trimmed, truncated := wrap(config, width, tc.text, out)
+						if truncateAfterLines == 0 {
+							// No line may exceed the given width.
+							for lineIdx, advance := range advances {
+								if advance > fixed.I(width) {
+									t.Errorf("width %d, paragraph direction %v: line %d advance %v exceeds max width",
+										width, paraDir, lineIdx, advance)
+								}
+							}
+						}
+						// The same paragraph wrapped through PrepareSegmented
+						// must give the same breaks.
+						var segWrapper LineWrapper
+						segWrapper.PrepareSegmented(config, &seg, NewSliceIterator([]Output{out.copy()}))
+						var segEnds []int
+						for {
+							line, done := segWrapper.WrapNextLine(width)
+							if line.Line == nil {
+								break
+							}
+							end := 0
+							for _, run := range line.Line {
+								end = run.Runes.Offset + run.Runes.Count
+							}
+							segEnds = append(segEnds, end)
+							if done {
+								break
+							}
+						}
+						if !reflect.DeepEqual(ends, segEnds) {
+							t.Errorf("width %d, paragraph direction %v: Prepare breaks %v, PrepareSegmented breaks %v",
+								width, paraDir, ends, segEnds)
+						}
+						results[i] = result{ends, advances, trimmed, truncated}
+					}
+					if !reflect.DeepEqual(results[0].ends, results[1].ends) {
+						t.Errorf("width %d, truncateAfterLines %d: LTR paragraph breaks %v, RTL paragraph breaks %v",
+							width, truncateAfterLines, results[0].ends, results[1].ends)
+					}
+					if !reflect.DeepEqual(results[0].trimmed, results[1].trimmed) {
+						t.Errorf("width %d, truncateAfterLines %d: LTR paragraph trimmed %v, RTL paragraph trimmed %v",
+							width, truncateAfterLines, results[0].trimmed, results[1].trimmed)
+					}
+					if results[0].truncated != results[1].truncated {
+						t.Errorf("width %d, truncateAfterLines %d: LTR paragraph truncated %d, RTL paragraph truncated %d",
+							width, truncateAfterLines, results[0].truncated, results[1].truncated)
+					}
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkWrappingWidths wraps a paragraph to several widths, as a layout
 // does when its size changes, computing the break opportunities for each
 // wrapping (Prepare), or once for all of them (PrepareSegmented).

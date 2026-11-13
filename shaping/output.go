@@ -210,14 +210,16 @@ func (o *Output) RecomputeAdvance() {
 // advanceSpaceAware adjust the value in [Advance]
 // if a white space character ends the run.
 // Any end letter spacing (on the last glyph) is also removed
-// The paragraphDir is the text direction of the overall paragraph containing o.
-// If the paragraphDir is different then o's Direction, this method has no effect
-// because the trailing space in this run will always be internal to the paragraph.
+//
+// The caller is responsible for only using this adjusted advance when the
+// end of the run falls on a visual edge of its line, that is when the
+// trailing whitespace is not visually sandwiched between other text on the
+// line (see [LineWrapper]).
 //
 // TODO: should we take into account multiple spaces ?
-func (o *Output) advanceSpaceAware(paragraphDir di.Direction) fixed.Int26_6 {
+func (o *Output) advanceSpaceAware() fixed.Int26_6 {
 	L := len(o.Glyphs)
-	if L == 0 || paragraphDir != o.Direction {
+	if L == 0 {
 		return o.Advance
 	}
 

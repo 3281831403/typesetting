@@ -754,6 +754,9 @@ type LineWrapper struct {
 
 	// mapper tracks rune->glyphCluster mappings.
 	mapper runMapper
+	// visualScratch is a reusable buffer used to compute the visual order
+	// of a candidate line.
+	visualScratch Line
 	// glyphRuns holds the runs of shaped text being wrapped.
 	glyphRuns RunIterator
 	// lineStartRune is the rune index of the first rune on the next line to
@@ -933,6 +936,40 @@ func reverseVisualOrder(line Line, start, end int) {
 	}
 }
 
+// lastRunEndsOnVisualEdge reports whether the logical end of the last run of
+// line falls on a visual edge of the line, that is whether the text ending
+// the line is not visually sandwiched between other text on the line.
+// The [VisualIndex] of each run must have been computed beforehand (see
+// computeBidiOrdering).
+func lastRunEndsOnVisualEdge(line Line) bool {
+	last := line[len(line)-1]
+	if last.Direction.Progression() == di.FromTopLeft {
+		// The logical end of the run is on its right: it falls on the
+		// visual edge of the line only if no other run is displayed
+		// further right.
+		return last.VisualIndex == int32(len(line)-1)
+	}
+	// The logical end of the run is on its left: it falls on the visual
+	// edge of the line only if no other run is displayed further left.
+	return last.VisualIndex == 0
+}
+
+// candidateEndsOnVisualEdge reports whether the logical end of candidateRun,
+// the last run of the current candidate line, falls on a visual edge of the
+// line. Only then is the whitespace ending the candidate line not visually
+// sandwiched between other text, so that it may be ignored when measuring
+// the line width.
+func (l *LineWrapper) candidateEndsOnVisualEdge(candidateRun Output) bool {
+	if l.scratch.candidateLen() == 0 {
+		// A single run is trivially at both visual edges of its line.
+		return true
+	}
+	l.visualScratch = append(l.visualScratch[:0], l.scratch.alt...)
+	l.visualScratch = append(l.visualScratch, candidateRun)
+	computeBidiOrdering(l.visualScratch)
+	return lastRunEndsOnVisualEdge(l.visualScratch)
+}
+
 // computeBidiOrdering resolves the [VisualIndex] of each run,
 // applying rule L2 of the Unicode BIDI algorithm, using the level field
 // of each run
@@ -979,44 +1016,38 @@ func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, b
 	var trimmed fixed.Int26_6
 	if len(finalLine) > 0 {
 		computeBidiOrdering(finalLine)
-		if !l.config.DisableTrailingWhitespaceTrim {
-			// Here we find the last visual run in the line.
-			goalIdx := len(finalLine) - 1
-			if l.config.Direction.Progression() == di.TowardTopLeft {
-				goalIdx = 0
-			}
-			for logicalIdx, run := range finalLine {
-				if run.VisualIndex == int32(goalIdx) {
-					goalIdx = logicalIdx
-					break
-				}
-			}
-			finalVisualRun := &finalLine[goalIdx]
+		if !l.config.DisableTrailingWhitespaceTrim && lastRunEndsOnVisualEdge(finalLine) {
+			// The logical end of the line falls on a visual edge of the
+			// line: the whitespace ending the last run is not visually
+			// sandwiched between other text on the line, so its advance is
+			// zeroed. This mirrors the line width computation, which
+			// ignores this whitespace when checking that the line fits.
+			finalRun := &finalLine[len(finalLine)-1]
 
-			// This next block locates the first/last visual glyph on the line and
-			// zeroes its advance if it is whitespace.
-			if L := len(finalVisualRun.Glyphs); L > 0 {
-				var finalVisualGlyph *Glyph
-				if l.config.Direction.Progression() == di.FromTopLeft {
-					finalVisualGlyph = &finalVisualRun.Glyphs[L-1]
+			// This next block locates the glyph ending the line (in logical
+			// order) and zeroes its advance if it is whitespace.
+			if L := len(finalRun.Glyphs); L > 0 {
+				var finalGlyph *Glyph
+				if finalRun.Direction.Progression() == di.FromTopLeft {
+					finalGlyph = &finalRun.Glyphs[L-1]
 				} else {
-					finalVisualGlyph = &finalVisualRun.Glyphs[0]
+					finalGlyph = &finalRun.Glyphs[0]
 				}
 
-				if finalVisualRun.Direction.IsVertical() {
-					if finalVisualGlyph.Height == 0 {
-						finalVisualGlyph.YAdvance = 0
-						finalVisualGlyph.Advance = 0
+				if finalRun.Direction.IsVertical() {
+					if finalGlyph.Height == 0 {
+						finalGlyph.YAdvance = 0
+						finalGlyph.Advance = 0
 					}
 				} else { // horizontal
-					if finalVisualGlyph.Width == 0 {
-						finalVisualGlyph.XAdvance = 0
-						finalVisualGlyph.Advance = 0
+					if finalGlyph.Width == 0 {
+						finalGlyph.XAdvance = 0
+						finalGlyph.Advance = 0
 					}
 				}
-				beforeTrim := finalVisualRun.Advance
-				finalVisualRun.RecomputeAdvance()
-				trimmed = beforeTrim - finalVisualRun.Advance
+				beforeTrim := finalRun.Advance
+				finalRun.RecomputeAdvance()
+				trimmed = beforeTrim - finalRun.Advance
 			}
 		}
 
@@ -1271,7 +1302,14 @@ func (l *LineWrapper) processBreakOption(option breakOption, config lineConfig) 
 	}
 	isFirstInLine := l.scratch.candidateLen() == 0
 	candidateRun := cutRun(run, l.mapper.mapping, l.lineStartRune, option.breakAtRune, isFirstInLine)
-	candidateLineWidth := candidateRun.advanceSpaceAware(l.config.Direction) + l.scratch.candidateAdvance()
+	candidateAdvance := candidateRun.Advance
+	if l.candidateEndsOnVisualEdge(candidateRun) {
+		// The end of the candidate run falls on a visual edge of the line:
+		// the whitespace ending it is not sandwiched between other text on
+		// the line, so it does not count toward the line width.
+		candidateAdvance = candidateRun.advanceSpaceAware()
+	}
+	candidateLineWidth := candidateAdvance + l.scratch.candidateAdvance()
 	if candidateLineWidth > config.maxWidth {
 		// The run doesn't fit on the line.
 		if !l.scratch.hasBest() {
