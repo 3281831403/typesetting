@@ -606,7 +606,9 @@ type wrapBuffer struct {
 	// alt is a smaller temporary buffer that holds candidate lines while
 	// they are being built.
 	alt []Output
-	// altAdvance is the sum of the advances of each run in alt.
+	// altAdvance is the length of the runs in alt measured along the
+	// progression direction. It is always non-negative, including for vertical
+	// runs whose signed advances are negative.
 	altAdvance fixed.Int26_6
 	// altSave is a slice into alt used to save and restore the state of the alt buffer.
 	altSave []Output
@@ -680,7 +682,9 @@ func (w *wrapBuffer) candidateLen() int { return len(w.alt) }
 // candidateAppend adds the given run to the current line wrapping candidate.
 func (w *wrapBuffer) candidateAppend(run Output) {
 	w.alt = append(w.alt, run)
-	w.altAdvance = w.altAdvance + run.Advance
+	// Accumulate the positive progression length, not the signed advance:
+	// vertical runs advance negatively.
+	w.altAdvance = w.altAdvance + run.lineLength()
 }
 
 // candidateSave captures the current state of the line candidate, enabling it to
@@ -838,7 +842,7 @@ func (l *LineWrapper) WrapParagraphF(config WrapConfig, maxWidth fixed.Int26_6, 
 			_, firstRun, hasFirst := runs.Next()
 			_, _, hasSecond := runs.Peek()
 			if hasFirst && !hasSecond {
-				if firstRun.Advance <= maxWidth {
+				if firstRun.lineLength() <= maxWidth {
 					return l.scratch.singleRunParagraph(firstRun), 0
 				}
 			}
@@ -1003,6 +1007,10 @@ func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, b
 					finalVisualGlyph = &finalVisualRun.Glyphs[0]
 				}
 
+				// Lengths are measured along the progression and are always
+				// non-negative, so the space reclaimed by the trim is the
+				// positive difference between the run length before and after it.
+				beforeTrim := finalVisualRun.lineLength()
 				if finalVisualRun.Direction.IsVertical() {
 					if finalVisualGlyph.Height == 0 {
 						finalVisualGlyph.YAdvance = 0
@@ -1014,9 +1022,8 @@ func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, b
 						finalVisualGlyph.Advance = 0
 					}
 				}
-				beforeTrim := finalVisualRun.Advance
 				finalVisualRun.RecomputeAdvance()
-				trimmed = beforeTrim - finalVisualRun.Advance
+				trimmed = beforeTrim - finalVisualRun.lineLength()
 			}
 		}
 
@@ -1103,7 +1110,7 @@ func (l *LineWrapper) WrapNextLineF(maxWidth fixed.Int26_6) (out WrappedLine, do
 	config := lineConfig{
 		truncating:        l.config.TruncateAfterLines == 1,
 		maxWidth:          maxWidth,
-		truncatedMaxWidth: maxWidth - l.config.Truncator.Advance,
+		truncatedMaxWidth: maxWidth - l.config.Truncator.lineLength(),
 	}
 	done = l.wrapNextLine(config)
 	finalLine := l.scratch.finalizeBest()
@@ -1271,6 +1278,8 @@ func (l *LineWrapper) processBreakOption(option breakOption, config lineConfig) 
 	}
 	isFirstInLine := l.scratch.candidateLen() == 0
 	candidateRun := cutRun(run, l.mapper.mapping, l.lineStartRune, option.breakAtRune, isFirstInLine)
+	// Both terms are non-negative lengths measured along the progression,
+	// so the comparison holds for horizontal lines and vertical columns alike.
 	candidateLineWidth := candidateRun.advanceSpaceAware(l.config.Direction) + l.scratch.candidateAdvance()
 	if candidateLineWidth > config.maxWidth {
 		// The run doesn't fit on the line.

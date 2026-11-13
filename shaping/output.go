@@ -196,6 +196,21 @@ func (o *Output) FromFontUnit(v float32) fixed.Int26_6 {
 	return fixed.Int26_6(v * float32(o.Size) / float32(o.Face.Upem()))
 }
 
+// lineLength returns the length occupied by the run along its layout axis,
+// measured in the direction of progression: it is always non-negative.
+// Horizontal runs store a positive [Output.Advance], while vertical runs store
+// a negative one (font space grows upward), so the vertical advance is negated.
+//
+// All line wrapping measurements (column length, truncation budget, trailing
+// whitespace trimming and spacing adjustments) must use this metric so that
+// horizontal and vertical text share the same arithmetic.
+func (o *Output) lineLength() fixed.Int26_6 {
+	if o.Direction.IsVertical() {
+		return -o.Advance
+	}
+	return o.Advance
+}
+
 // RecomputeAdvance updates only the Advance field based on the current
 // contents of the Glyphs field. It is faster than RecalculateAll(),
 // and can be used to speed up line wrapping logic.
@@ -207,9 +222,11 @@ func (o *Output) RecomputeAdvance() {
 	o.Advance = advance
 }
 
-// advanceSpaceAware adjust the value in [Advance]
-// if a white space character ends the run.
-// Any end letter spacing (on the last glyph) is also removed
+// advanceSpaceAware returns the length of the run along its layout axis,
+// measured in the direction of progression (always non-negative), adjusted if
+// a white space character ends the run. The trailing whitespace glyph and any
+// end letter spacing (on the last glyph) are removed from the measurement, so
+// that line wrapping does not reserve room for space at a break.
 // The paragraphDir is the text direction of the overall paragraph containing o.
 // If the paragraphDir is different then o's Direction, this method has no effect
 // because the trailing space in this run will always be internal to the paragraph.
@@ -218,7 +235,7 @@ func (o *Output) RecomputeAdvance() {
 func (o *Output) advanceSpaceAware(paragraphDir di.Direction) fixed.Int26_6 {
 	L := len(o.Glyphs)
 	if L == 0 || paragraphDir != o.Direction {
-		return o.Advance
+		return o.lineLength()
 	}
 
 	// adjust the last to account for spaces
@@ -228,14 +245,19 @@ func (o *Output) advanceSpaceAware(paragraphDir di.Direction) fixed.Int26_6 {
 	} else {
 		lastG = o.Glyphs[0]
 	}
+	// Advance is signed according to the layout axis: positive along the
+	// progression for horizontal text, negative for vertical text. Remove the
+	// trailing contribution in the same signed convention, then return the
+	// positive length along the progression.
 	if o.Direction.IsVertical() {
 		if lastG.Height == 0 {
-			return o.Advance - lastG.Advance
+			return -o.Advance + lastG.Advance
 		}
-	} else { // horizontal
-		if lastG.Width == 0 {
-			return o.Advance - lastG.Advance
-		}
+		return -o.Advance + lastG.endLetterSpacing
+	}
+	// horizontal
+	if lastG.Width == 0 {
+		return o.Advance - lastG.Advance
 	}
 	return o.Advance - lastG.endLetterSpacing
 }

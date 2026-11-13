@@ -40,11 +40,13 @@ func TestOutput_addWordSpacing(t *testing.T) {
 	out.AddWordSpacing(arabic, addSpacing)
 	tu.Assert(t, out.Advance == withoutSpacing+1*addSpacing)
 
-	// vertical
+	// vertical: advances are negative, so added spacing must make the advance
+	// more negative and its absolute length (the column length) larger.
 	out = simpleShape(english, latinFont, di.DirectionTTB)
 	withoutSpacing = out.Advance
 	out.AddWordSpacing(english, addSpacing)
-	tu.Assert(t, out.Advance == withoutSpacing+6*addSpacing)
+	tu.Assert(t, out.Advance == withoutSpacing-6*addSpacing)
+	tu.Assert(t, -out.Advance == -withoutSpacing+6*addSpacing)
 }
 
 func TestOutput_addLetterSpacing(t *testing.T) {
@@ -83,7 +85,14 @@ func TestOutput_addLetterSpacing(t *testing.T) {
 		out := simpleShape(test.text, test.face, test.dir)
 		withoutSpacing := out.Advance
 		out.AddLetterSpacing(addSpacing, test.start, test.end)
-		tu.Assert(t, out.Advance == withoutSpacing+test.expectedBonusAdvance)
+		if test.dir.IsVertical() {
+			// Vertical advances grow in the negative direction: spacing makes
+			// the advance more negative by exactly the added column length.
+			tu.Assert(t, out.Advance == withoutSpacing-test.expectedBonusAdvance)
+			tu.Assert(t, -out.Advance == -withoutSpacing+test.expectedBonusAdvance)
+		} else {
+			tu.Assert(t, out.Advance == withoutSpacing+test.expectedBonusAdvance)
+		}
 	}
 }
 
