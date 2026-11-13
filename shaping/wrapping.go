@@ -252,6 +252,45 @@ func cutRun(run Output, mapping []glyphIndex, startRune, endRune int, trimStart 
 	return run
 }
 
+// cutRun is equivalent to the [cutRun] function, using the mapper's precomputed
+// data for the run. run must be the run currently held by the mapper (that is,
+// [runMapper.mapRun] must have been called with it first). When the run has no
+// letter spacing, the advance of the sub-run is computed in constant time from
+// the prefix sums of the glyph advances, instead of being recomputed by summing
+// the glyphs; this keeps line wrapping linear in the number of break candidates.
+// The result is identical to what [cutRun] would return.
+func (l *LineWrapper) cutRun(run Output, startRune, endRune int, trimStart bool) Output {
+	if l.mapper.hasLetterSpacing {
+		// Letter spacing is trimmed (mutating glyph advances) at line starts,
+		// which the precomputed prefix sums cannot account for: use the
+		// recomputing path.
+		return cutRun(run, l.mapper.mapping, startRune, endRune, trimStart)
+	}
+	mapping := l.mapper.mapping
+	// Convert the rune range of interest into an inclusive range within the
+	// current run's runes.
+	runeStart := startRune - run.Runes.Offset
+	runeEnd := endRune - run.Runes.Offset
+	if runeStart < 0 {
+		runeStart = 0
+	}
+	if runeEnd >= len(mapping) {
+		runeEnd = len(mapping) - 1
+	}
+	glyphStart, glyphEnd := inclusiveGlyphRange(run.Direction, runeStart, runeEnd, mapping, len(run.Glyphs))
+
+	// Construct a run out of the inclusive glyph range.
+	run.Glyphs = run.Glyphs[glyphStart : glyphEnd+1]
+	run.Runes.Count = runeEnd - runeStart + 1
+	run.Runes.Offset = run.Runes.Offset + runeStart
+	// Without letter spacing, trimStartLetterSpacing is a no-op, and the glyph
+	// advances cannot have been mutated since the prefix sums were computed
+	// (the trailing whitespace trim of the previous line only affects glyphs
+	// before this line's start, which are never part of later sub-runs).
+	run.Advance = l.mapper.advances[glyphEnd+1] - l.mapper.advances[glyphStart]
+	return run
+}
+
 // breakOption represets a location within the rune slice at which
 // it may be safe to break a line of text.
 type breakOption struct {
@@ -505,6 +544,17 @@ type runMapper struct {
 	// mapping holds the rune->glyph mapping for the run at index mappedRun within
 	// glyphRuns.
 	mapping []glyphIndex
+	// advances holds the prefix sums of the glyph advances of the mapped run:
+	// advances[i] is the sum of the advances of glyphs[:i], so the advance of
+	// glyphs[start:end+1] is advances[end+1]-advances[start]. It allows cutRun
+	// to compute the advance of a sub-run in constant time instead of summing
+	// the glyphs again for every line breaking candidate.
+	advances []fixed.Int26_6
+	// hasLetterSpacing indicates that some glyph of the mapped run has a
+	// non-zero start letter spacing. The wrapper trims it at line starts,
+	// which mutates the glyph advances and would stale the prefix sums, so
+	// such runs always use the slow (recomputing) path.
+	hasLetterSpacing bool
 }
 
 // mapRun updates the mapping field to be valid for the given run. It will skip the mapping
@@ -513,6 +563,22 @@ type runMapper struct {
 func (r *runMapper) mapRun(runIdx int, run Output) {
 	if r.runIdx != runIdx || !r.valid {
 		r.mapping = mapRunesToClusterIndices3(run.Direction, run.Runes, run.Glyphs, r.mapping)
+		if cap(r.advances) >= len(run.Glyphs)+1 {
+			r.advances = r.advances[:len(run.Glyphs)+1]
+		} else {
+			r.advances = make([]fixed.Int26_6, len(run.Glyphs)+1)
+		}
+		var sum fixed.Int26_6
+		hasLetterSpacing := false
+		for i, g := range run.Glyphs {
+			r.advances[i] = sum
+			sum += g.Advance
+			if g.startLetterSpacing != 0 {
+				hasLetterSpacing = true
+			}
+		}
+		r.advances[len(run.Glyphs)] = sum
+		r.hasLetterSpacing = hasLetterSpacing
 		r.runIdx = runIdx
 		r.valid = true
 	}
@@ -618,6 +684,17 @@ type wrapBuffer struct {
 	best []Output
 	// bestInLine tracks whether the current best is allocated from within line.
 	bestInLine bool
+	// bestMarked tracks whether markCandidateBest has been called since the
+	// last startLine, that is whether best holds a valid line (possibly empty).
+	bestMarked bool
+	// bestLen is the length of the alt buffer at the time of the last call to
+	// markCandidateBest. The actual copy of the candidate into best is deferred
+	// to finalizeBest: until then, the candidate is only appended to or
+	// truncated to a checkpointed state (which is never shorter than bestLen),
+	// so alt[:bestLen] still holds the marked candidate.
+	bestLen int
+	// bestSuffix holds the suffixes provided to the last markCandidateBest call.
+	bestSuffix []Output
 }
 
 func (w *wrapBuffer) reset() {
@@ -639,6 +716,9 @@ func (w *wrapBuffer) reset() {
 	w.lineUsed = 0
 	w.best = nil
 	w.bestInLine = false
+	w.bestMarked = false
+	w.bestLen = 0
+	w.bestSuffix = w.bestSuffix[:0]
 	if w.lineExhausted {
 		w.lineExhausted = false
 		// Trigger the go slice growth heuristic by appending an element to
@@ -672,6 +752,9 @@ func (w *wrapBuffer) startLine() {
 	w.altAdvanceSave = 0
 	w.best = nil
 	w.bestInLine = false
+	w.bestMarked = false
+	w.bestLen = 0
+	w.bestSuffix = w.bestSuffix[:0]
 }
 
 // candidateLen returns the number of [Output]s in the current line wrapping candidate.
@@ -707,8 +790,28 @@ func (w *wrapBuffer) candidateAdvance() fixed.Int26_6 {
 // known line wrapping candidate with the given suffixes. Providing suffixes does
 // not modify the current candidate, but does ensure that the "best" candidate ends
 // with them.
+//
+// The copy of the candidate is deferred to finalizeBest: only the current
+// candidate length and the suffixes are recorded here, which keeps
+// markCandidateBest O(len(suffixes)) instead of O(len(candidate)).
 func (w *wrapBuffer) markCandidateBest(suffixes ...Output) {
-	neededLen := len(w.alt) + len(suffixes)
+	w.bestMarked = true
+	w.bestLen = len(w.alt)
+	w.bestSuffix = append(w.bestSuffix[:0], suffixes...)
+}
+
+// hasBest returns whether there is currently a known valid line wrapping candidate
+// for the line.
+func (w *wrapBuffer) hasBest() bool {
+	return w.bestMarked && w.bestLen+len(w.bestSuffix) > 0
+}
+
+// finalizeBest commits the storage for the current best line and returns it.
+func (w *wrapBuffer) finalizeBest() []Output {
+	if !w.bestMarked {
+		return nil
+	}
+	neededLen := w.bestLen + len(w.bestSuffix)
 	if len(w.line[w.lineUsed:cap(w.line)]) < neededLen {
 		w.lineExhausted = true
 		w.best = make([]Output, neededLen)
@@ -717,18 +820,8 @@ func (w *wrapBuffer) markCandidateBest(suffixes ...Output) {
 		w.best = w.line[w.lineUsed : w.lineUsed+neededLen]
 		w.bestInLine = true
 	}
-	n := copy(w.best, w.alt)
-	copy(w.best[n:], suffixes)
-}
-
-// hasBest returns whether there is currently a known valid line wrapping candidate
-// for the line.
-func (w *wrapBuffer) hasBest() bool {
-	return len(w.best) > 0
-}
-
-// finalizeBest commits the storage for the current best line and returns it.
-func (w *wrapBuffer) finalizeBest() []Output {
+	n := copy(w.best, w.alt[:w.bestLen])
+	copy(w.best[n:], w.bestSuffix)
 	if w.bestInLine {
 		w.lineUsed += len(w.best)
 	}
@@ -879,7 +972,7 @@ func (l *LineWrapper) fillUntil(runs RunIterator, option breakOption) {
 			// the runes corresponding to those glyphs off.
 			l.mapper.mapRun(currRunIndex, run)
 			isFirstInLine := l.scratch.candidateLen() == 0
-			run = cutRun(run, l.mapper.mapping, l.lineStartRune, run.Runes.Count+run.Runes.Offset, isFirstInLine)
+			run = l.cutRun(run, l.lineStartRune, run.Runes.Count+run.Runes.Offset, isFirstInLine)
 		}
 		// While the run being processed doesn't contain the current line breaking
 		// candidate, just append it to the candidate line.
@@ -1270,7 +1363,7 @@ func (l *LineWrapper) processBreakOption(option breakOption, config lineConfig) 
 		return breakInvalid, Output{}
 	}
 	isFirstInLine := l.scratch.candidateLen() == 0
-	candidateRun := cutRun(run, l.mapper.mapping, l.lineStartRune, option.breakAtRune, isFirstInLine)
+	candidateRun := l.cutRun(run, l.lineStartRune, option.breakAtRune, isFirstInLine)
 	candidateLineWidth := candidateRun.advanceSpaceAware(l.config.Direction) + l.scratch.candidateAdvance()
 	if candidateLineWidth > config.maxWidth {
 		// The run doesn't fit on the line.
